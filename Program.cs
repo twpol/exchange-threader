@@ -9,6 +9,15 @@ namespace Exchange_Threader
 {
     class Program
     {
+        // Specification: https://docs.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxprops/76c027d8-c871-4e40-9a14-28f6596a7732
+        static ExtendedPropertyDefinition pidTagMessageDeliveryTime = new ExtendedPropertyDefinition(0x0E06, MapiPropertyType.SystemTime);
+
+        // Specification: https://docs.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxprops/57f8de0f-5f53-423a-8947-7943dd959997
+        static ExtendedPropertyDefinition pidTagConversationIndex = new ExtendedPropertyDefinition(0x0071, MapiPropertyType.Binary);
+
+        // Specification: https://docs.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxprops/b8512359-6711-4cae-81aa-1b046a089342
+        static ExtendedPropertyDefinition pidTagTransportMessageHeaders = new ExtendedPropertyDefinition(0x007D, MapiPropertyType.String);
+
         /// <param name="folder">Exchange folder to scan for conversations to fix</param>
         /// <param name="config">Path to configuration file</param>
         /// <param name="dryRun">Do not perform any actions, only pretend</param>
@@ -16,6 +25,7 @@ namespace Exchange_Threader
         {
             if (config == null) config = new FileInfo("config.json");
             if (String.IsNullOrEmpty(folder)) throw new InvalidOperationException("Must specify Exchange folder to scan");
+            LoadOriginalReceived();
             RunAsync(LoadConfiguration(config), dryRun, folder).Wait();
         }
 
@@ -24,6 +34,17 @@ namespace Exchange_Threader
             return new ConfigurationBuilder()
                 .AddJsonFile(config.FullName, true)
                 .Build();
+        }
+
+        static Dictionary<string, DateTime> OriginalReceived = new();
+
+        static void LoadOriginalReceived()
+        {
+            foreach (var line in File.ReadAllLines("Original Received.txt"))
+            {
+                var part = line.Split(" --> ");
+                OriginalReceived[part[0]] = DateTime.Parse(part[1]);
+            }
         }
 
         static async System.Threading.Tasks.Task RunAsync(IConfigurationRoot config, bool dryRun, string folderPath)
@@ -95,7 +116,7 @@ namespace Exchange_Threader
             var groupedEmails = GroupEmailsByMessageId(emails).SelectMany(GroupEmailsByDate);
             foreach (var group in groupedEmails)
             {
-                await SetConversationIndex(group, dryRun);
+                await SetConversationIndex(group, conversationTopic, dryRun);
             }
         }
 
@@ -146,7 +167,7 @@ namespace Exchange_Threader
             return emailGroups;
         }
 
-        static async System.Threading.Tasks.Task SetConversationIndex(IEnumerable<EmailMessage> emails, bool dryRun)
+        static async System.Threading.Tasks.Task SetConversationIndex(IEnumerable<EmailMessage> emails, string conversationTopic, bool dryRun)
         {
             // From https://social.msdn.microsoft.com/Forums/office/en-US/4a5b4890-0f37-4b10-b3e2-495182581d34/msoxomsg-pidtagconversationindex-description-incorrect?forum=os_exchangeprotocols:
             //      Right now I know that there are at least two algorithms in use for computing the FILETIME field:
@@ -159,46 +180,62 @@ namespace Exchange_Threader
             // when the high byte of FILETIME rolls over from 0x01 to 0x02), whilst still giving 1.6777216 second
             // accuracy in the conversation index (which does not need more precision as it is only a sort key).
 
-            // Specification: https://docs.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxprops/57f8de0f-5f53-423a-8947-7943dd959997
-            var pidTagConversationIndex = new ExtendedPropertyDefinition(0x0071, MapiPropertyType.Binary);
-
-            // Specification: https://docs.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxprops/76c027d8-c871-4e40-9a14-28f6596a7732
-            var pidTagMessageDeliveryTime = new ExtendedPropertyDefinition(0x0E06, MapiPropertyType.SystemTime);
-
             var conversationStartTime = DateTimeOffset.MinValue;
             var conversationIndex = new List<byte>();
+            var emailsUpdated = 0;
 
             foreach (var email in emails.OrderBy(email => email.DateTimeSent))
             {
-                if (conversationIndex.Count == 0)
+                var key = $"{conversationTopic} <-> {email.DateTimeSent}";
+                if (OriginalReceived.ContainsKey(key))
                 {
-                    conversationStartTime = new DateTimeOffset(email.DateTimeSent);
-                    conversationIndex.Add(1);
-                    conversationIndex.AddRange(BigEndianLongToBytes(conversationStartTime.ToFileTime()).Take(5));
-                    conversationIndex.AddRange(email.ConversationIndex.Skip(6).Take(16));
-                }
-                else
-                {
-                    var timeDiff100NS = (long)(email.DateTimeSent - conversationStartTime).TotalMilliseconds * 10000;
-                    if ((timeDiff100NS & 0x00FE000000000000) == 0)
+                    if (email.DateTimeReceived != OriginalReceived[key])
                     {
-                        conversationIndex.AddRange(BigEndianLongToBytes((timeDiff100NS >> 18) & 0x7FFFFFFF).Skip(4));
+                        Console.WriteLine($"  {email.Id} - {email.DateTimeSent} - {email.DateTimeReceived} --> {OriginalReceived[key]}");
+                        if (!dryRun)
+                        {
+                            email.SetExtendedProperty(pidTagMessageDeliveryTime, OriginalReceived[key]);
+                            await email.Update(ConflictResolutionMode.AutoResolve, true);
+                            emailsUpdated++;
+                        }
                     }
-                    else
-                    {
-                        conversationIndex.AddRange(BigEndianLongToBytes(0x10000000 | ((timeDiff100NS >> 23) & 0x7FFFFFFF)).Skip(4));
-                    }
-                    conversationIndex.Add(0);
                 }
-                Console.WriteLine($"  {email.DateTimeSent} -> {email.DateTimeReceived} - {ByteToString(email.ConversationIndex)} -> {ByteToString(conversationIndex)}");
-                if (!dryRun)
-                {
-                    email.SetExtendedProperty(pidTagMessageDeliveryTime, email.DateTimeSent);
-                    email.SetExtendedProperty(pidTagConversationIndex, conversationIndex.ToArray());
-                    await email.Update(ConflictResolutionMode.AutoResolve, true);
-                }
+
+                // if (conversationIndex.Count == 0)
+                // {
+                //     conversationStartTime = new DateTimeOffset(email.DateTimeSent);
+                //     conversationIndex.Add(1);
+                //     conversationIndex.AddRange(BigEndianLongToBytes(conversationStartTime.ToFileTime()).Take(5));
+                //     conversationIndex.AddRange(email.ConversationIndex.Skip(6).Take(16));
+                // }
+                // else
+                // {
+                //     var timeDiff100NS = (long)(email.DateTimeSent - conversationStartTime).TotalMilliseconds * 10000;
+                //     if ((timeDiff100NS & 0x00FE000000000000) == 0)
+                //     {
+                //         conversationIndex.AddRange(BigEndianLongToBytes((timeDiff100NS >> 18) & 0x7FFFFFFF).Skip(4));
+                //     }
+                //     else
+                //     {
+                //         conversationIndex.AddRange(BigEndianLongToBytes(0x10000000 | ((timeDiff100NS >> 23) & 0x7FFFFFFF)).Skip(4));
+                //     }
+                //     conversationIndex.Add(0);
+                // }
+                // if (ByteToString(email.ConversationIndex) != ByteToString(conversationIndex))
+                // {
+                //     Console.WriteLine($"  {email.DateTimeSent} - {email.DateTimeReceived} - {ByteToString(email.ConversationIndex)} -> {ByteToString(conversationIndex)}");
+                //     if (!dryRun)
+                //     {
+                //         email.SetExtendedProperty(pidTagConversationIndex, conversationIndex.ToArray());
+                //         await email.Update(ConflictResolutionMode.AutoResolve, true);
+                //         emailsUpdated++;
+                //     }
+                // }
             }
-            if (!dryRun) Console.WriteLine($"  Updated {emails.Count()} emails");
+            if (!dryRun)
+            {
+                Console.WriteLine($"  Updated {emailsUpdated} emails ({emails.Min(email => email.DateTimeSent)} -> {emails.Max(email => email.DateTimeSent)})");
+            }
         }
 
         static string ByteToString(IEnumerable<byte> bytes)
