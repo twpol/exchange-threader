@@ -252,28 +252,23 @@ namespace Exchange_Threader
         }
 
         [DebuggerDisplay("{Message.DateTimeSent} - {MutableChildren.Count}")]
-        class ThreadedEmailMessage : IComparer<DateTime>
+        class ThreadedEmailMessage
         {
             public EmailMessage Message;
             public ImmutableList<ThreadedEmailMessage> Children { get => MutableChildren.Values.ToImmutableList(); }
             public byte[] ConversationIndex { get; set; }
 
-            SortedList<DateTime, ThreadedEmailMessage> MutableChildren;
+            SortedList<string, ThreadedEmailMessage> MutableChildren;
 
             public ThreadedEmailMessage(EmailMessage message)
             {
                 Message = message;
-                MutableChildren = new(this);
+                MutableChildren = new(StringComparer.Ordinal);
             }
 
             public void AddChild(ThreadedEmailMessage thread)
             {
-                MutableChildren.Add(thread.Message.DateTimeSent, thread);
-            }
-
-            public int Compare(DateTime x, DateTime y)
-            {
-                return (int)(x - y).TotalMilliseconds;
+                MutableChildren.Add($"{thread.Message.DateTimeSent.ToUniversalTime():u} {thread.Message.InternetMessageId} {thread.Message.Id}", thread);
             }
         }
     }
