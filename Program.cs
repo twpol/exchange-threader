@@ -1,9 +1,11 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.Exchange.WebServices.Data;
 using Microsoft.Extensions.Configuration;
 
@@ -42,7 +44,7 @@ namespace Exchange_Threader
             var folder = await GetFolder(service, folderPath);
 
             Console.WriteLine($"Looking for conversations...");
-            var conversations = await service.FindConversation(new ConversationIndexedItemView(int.MaxValue), folder.Id);
+            var conversations = await Retry("find conversations", () => service.FindConversation(new ConversationIndexedItemView(int.MaxValue), folder.Id));
             var conversationTopics = conversations.Select(c => c.Topic).Distinct();
 
             var emailsUpdated = 0;
@@ -63,16 +65,16 @@ namespace Exchange_Threader
 
         static async System.Threading.Tasks.Task<Folder> GetFolder(ExchangeService service, string path)
         {
-            return await GetChildFolder(await Folder.Bind(service, WellKnownFolderName.MsgFolderRoot), path.Split("/").ToArray());
+            return await GetChildFolder(await Retry("bind root folder", () => Folder.Bind(service, WellKnownFolderName.MsgFolderRoot)), path.Split("/").ToArray());
         }
 
         static async System.Threading.Tasks.Task<Folder> GetChildFolder(Folder folder, string[] children)
         {
-            var folders = await folder.FindFolders(new SearchFilter.IsEqualTo(FolderSchema.DisplayName, children[0]), new FolderView(10));
+            var folders = await Retry("find folder", () => folder.FindFolders(new SearchFilter.IsEqualTo(FolderSchema.DisplayName, children[0]), new FolderView(10)));
             if (folders.Folders.Count != 1) throw new InvalidDataException($"Cannot find folder level '{children[0]}' below '{folder.DisplayName}'");
             if (children.Length > 1)
             {
-                return await GetChildFolder(folders.Folders[0], children.Skip(1).ToArray());
+                return await Retry("find child folder", () => GetChildFolder(folders.Folders[0], children.Skip(1).ToArray()));
             }
             return folders.Folders[0];
         }
@@ -83,7 +85,7 @@ namespace Exchange_Threader
             Console.WriteLine(conversationTopic);
 
             // Find Outlook's own search folder "AllItems", which includes all folders in the account.
-            var allItems = await service.FindFolders(WellKnownFolderName.Root, new SearchFilter.IsEqualTo(FolderSchema.DisplayName, "AllItems"), new FolderView(10));
+            var allItems = await Retry("find AllItems folder", () => service.FindFolders(WellKnownFolderName.Root, new SearchFilter.IsEqualTo(FolderSchema.DisplayName, "AllItems"), new FolderView(10)));
             if (allItems.Folders.Count != 1) throw new MissingMemberException("AllItems");
 
             // Find all emails in this conversation
@@ -101,7 +103,7 @@ namespace Exchange_Threader
             FindItemsResults<Item> all;
             do
             {
-                all = await allItems.Folders[0].FindItems(emailFilter, emailView);
+                all = await Retry("find conversation items", () => allItems.Folders[0].FindItems(emailFilter, emailView));
                 emails.AddRange(all.Items.Cast<EmailMessage>());
                 emailView.Offset = all.NextPageOffset ?? 0;
             } while (all.MoreAvailable);
@@ -163,7 +165,7 @@ namespace Exchange_Threader
                     if (!dryRun)
                     {
                         email.Message.SetExtendedProperty(pidTagConversationIndex, email.ConversationIndex.ToArray());
-                        await email.Message.Update(ConflictResolutionMode.AutoResolve, true);
+                        await Retry("save email", () => email.Message.Update(ConflictResolutionMode.AutoResolve, true));
                     }
                     emailsUpdated++;
                 }
@@ -217,6 +219,22 @@ namespace Exchange_Threader
             foreach (var reply in emailChain.Last().Children)
             {
                 await SetThreadConversationIndex(emailChain.Append(reply).ToList());
+            }
+        }
+
+        static async Task<T> Retry<T>(string name, Func<Task<T>> action)
+        {
+            while (true)
+            {
+                try
+                {
+                    return await action();
+                }
+                catch (ServerBusyException error)
+                {
+                    Console.WriteLine($"Retry of {name} due to server busy (back off for {error.BackOffMilliseconds} ms)");
+                    Thread.Sleep(error.BackOffMilliseconds);
+                }
             }
         }
 
