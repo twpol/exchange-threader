@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Diagnostics;
@@ -55,11 +55,11 @@ namespace Exchange_Threader
 
             if (dryRun)
             {
-                Console.WriteLine($"  Would have updated {emailsUpdated} emails");
+                Console.WriteLine($"Would have updated {emailsUpdated} emails");
             }
             else
             {
-                Console.WriteLine($"  Updated {emailsUpdated} emails");
+                Console.WriteLine($"Updated {emailsUpdated} emails");
             }
         }
 
@@ -175,16 +175,21 @@ namespace Exchange_Threader
 
         static async System.Threading.Tasks.Task SetThreadConversationIndex(IList<ThreadedEmailMessage> emailChain)
         {
-            // From https://social.msdn.microsoft.com/Forums/office/en-US/4a5b4890-0f37-4b10-b3e2-495182581d34/msoxomsg-pidtagconversationindex-description-incorrect?forum=os_exchangeprotocols:
-            //      Right now I know that there are at least two algorithms in use for computing the FILETIME field:
-            //          Outlook client: Reserves the first byte, then uses bits 55-16 of the current FILETIME value to complete the field.
-            //          Exchange: Reserves the first byte, then uses bits 63-32 of the current FILETIME value to complete the field.
-            // Specification for Outlook client: https://docs.microsoft.com/en-us/office/client-developer/outlook/mapi/tracking-conversations
-            // Specification for Exchange: https://docs.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxomsg/9e994fbb-b839-495f-84e3-2c8c02c7dd9b
-
-            // We'll use the Exchange specification, which avoids the Outlook client's year 2057 problem (which is
-            // when the high byte of FILETIME rolls over from 0x01 to 0x02), whilst still giving 1.6777216 second
-            // accuracy in the conversation index (which does not need more precision as it is only a sort key).
+            // There are two separate specifications for the 5 bytes of time data in the conversation index header:
+            //   Specification for Outlook: https://docs.microsoft.com/en-us/office/client-developer/outlook/mapi/tracking-conversations
+            //   Specification for Exchange: https://docs.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxomsg/9e994fbb-b839-495f-84e3-2c8c02c7dd9b
+            //
+            // We'll use the Exchange specification, which avoids Outlook's year 2057 problem. This occurs because
+            // bits above 56 are not known, which limits the value to 456.69 years from 1601, i.e. year 2057.69. As a
+            // sort key, this is not strictly necessary, however, avoiding the wrapping during 2057 doesn't loose us
+            // much, as precision only drops to 1.678 seconds (from 0.00655 seconds).
+            //
+            // Timestamp in opening index:
+            //   If Outlook, assume bit 56 = 1 and store bits 55 - 16 (up to 456.69 years at 0.00655 seconds precision)
+            //   If Exchange, store bits 63 - 24 (up to 58455.80 years at 1.678 seconds precision)
+            // Timestamp delta in subsequent indexes is either:
+            //   If <= 48 bits, store bits 48 - 18 (up to 1.78 years at 0.026 seconds precision)
+            //   If >= 49 bits, store bits 53 - 23 (up to 57.08 years at 0.839 seconds precision)
 
             var conversationStartTime = new DateTimeOffset(emailChain.First().Message.DateTimeSent);
             var email = emailChain[emailChain.Count - 1];
