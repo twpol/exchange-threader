@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Diagnostics;
@@ -123,21 +123,34 @@ namespace Exchange_Threader
             while (emails.Count > 0)
             {
                 var matched = 0;
-                foreach (var email in emails.ToArray())
+                foreach (var email in emails.OrderBy(email => email.DateTimeSent).ToArray())
                 {
-                    if (!messageIds.Contains(email.InReplyTo))
+                    if (email.InReplyTo != null && allThreads.ContainsKey(email.InReplyTo))
                     {
+                        // Child of an existing message
                         var thread = new ThreadedEmailMessage(email);
                         allThreads[email.InternetMessageId] = thread;
+                        allThreads[email.InReplyTo].AddChild(thread);
+                        emails.Remove(email);
+                        matched++;
+                    }
+                    else if (email.InReplyTo != null && !messageIds.Contains(email.InReplyTo))
+                    {
+                        // Child of a message we don't have - fake the parent
+                        Console.WriteLine($"WARNING: Email In-Reply-To {email.InReplyTo} not found; faking it");
+                        var thread = new ThreadedEmailMessage(email);
+                        allThreads[email.InternetMessageId] = thread;
+                        allThreads[email.InReplyTo] = thread;
                         threads.Add(thread);
                         emails.Remove(email);
                         matched++;
                     }
-                    else if (allThreads.ContainsKey(email.InReplyTo))
+                    else if (email.InReplyTo == null)
                     {
+                        // Root message
                         var thread = new ThreadedEmailMessage(email);
                         allThreads[email.InternetMessageId] = thread;
-                        allThreads[email.InReplyTo].AddChild(thread);
+                        threads.Add(thread);
                         emails.Remove(email);
                         matched++;
                     }
