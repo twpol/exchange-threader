@@ -54,14 +54,8 @@ namespace Exchange_Threader
                 emailsUpdated += await FixEmailConversationTopic(service, conversationTopic, verbose, dryRun);
             }
 
-            if (dryRun)
-            {
-                Console.WriteLine($"Would have updated {emailsUpdated} emails");
-            }
-            else
-            {
-                Console.WriteLine($"Updated {emailsUpdated} emails");
-            }
+            if (dryRun) Console.WriteLine($"Would have updated {emailsUpdated} emails");
+            if (!dryRun) Console.WriteLine($"Updated {emailsUpdated} emails");
         }
 
         static async System.Threading.Tasks.Task<Folder> GetFolder(ExchangeService service, string path)
@@ -189,14 +183,8 @@ namespace Exchange_Threader
             }
             if (emailsUpdated > 0)
             {
-                if (dryRun)
-                {
-                    Console.WriteLine($"Would have updated {emailsUpdated} emails received between {minReceived:u} and {maxReceived:u} in topic {conversationTopic}");
-                }
-                else
-                {
-                    Console.WriteLine($"Updated {emailsUpdated} emails received between {minReceived:u} and {maxReceived:u} in topic {conversationTopic}");
-                }
+                if (dryRun) Console.WriteLine($"Would have updated {emailsUpdated} emails received between {minReceived:u} and {maxReceived:u} in topic {conversationTopic}");
+                if (!dryRun) Console.WriteLine($"Updated {emailsUpdated} emails received between {minReceived:u} and {maxReceived:u} in topic {conversationTopic}");
             }
             return emailsUpdated;
         }
