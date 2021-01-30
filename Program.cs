@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Diagnostics;
@@ -18,13 +18,14 @@ namespace Exchange_Threader
 
         /// <param name="folder">Exchange folder to scan for conversations to fix</param>
         /// <param name="config">Path to configuration file</param>
+        /// <param name="verbose">Display more details about what's going on</param>
         /// <param name="dryRun">Do not perform any actions, only pretend</param>
-        static void Main(string folder, FileInfo config = null, bool dryRun = false)
+        static void Main(string folder, FileInfo config = null, bool verbose = false, bool dryRun = false)
         {
             if (config == null) config = new FileInfo("config.json");
             if (String.IsNullOrEmpty(folder)) throw new InvalidOperationException("Must specify Exchange folder to scan");
             if (dryRun) Console.WriteLine("DRY RUN mode - no changes will be saved");
-            RunAsync(LoadConfiguration(config), dryRun, folder).Wait();
+            RunAsync(LoadConfiguration(config), verbose, dryRun, folder).Wait();
         }
 
         static IConfigurationRoot LoadConfiguration(FileInfo config)
@@ -34,23 +35,23 @@ namespace Exchange_Threader
                 .Build();
         }
 
-        static async System.Threading.Tasks.Task RunAsync(IConfigurationRoot config, bool dryRun, string folderPath)
+        static async System.Threading.Tasks.Task RunAsync(IConfigurationRoot config, bool verbose, bool dryRun, string folderPath)
         {
             var service = new ExchangeService(ExchangeVersion.Exchange2016);
             service.Credentials = new WebCredentials(config["username"], config["password"]);
             service.AutodiscoverUrl(config["email"], redirectionUri => new Uri(redirectionUri).Scheme == "https");
 
-            Console.WriteLine($"Looking for folder '{folderPath}'...");
+            if (verbose) Console.WriteLine($"VERBOSE: Looking for folder '{folderPath}'...");
             var folder = await GetFolder(service, folderPath);
 
-            Console.WriteLine($"Looking for conversations...");
+            if (verbose) Console.WriteLine($"VERBOSE: Looking for conversations...");
             var conversations = await Retry("find conversations", () => service.FindConversation(new ConversationIndexedItemView(int.MaxValue), folder.Id));
             var conversationTopics = conversations.Select(c => c.Topic).Distinct();
 
             var emailsUpdated = 0;
             foreach (var conversationTopic in conversationTopics)
             {
-                emailsUpdated += await FixEmailConversationTopic(service, conversationTopic, dryRun);
+                emailsUpdated += await FixEmailConversationTopic(service, conversationTopic, verbose, dryRun);
             }
 
             if (dryRun)
@@ -79,10 +80,9 @@ namespace Exchange_Threader
             return folders.Folders[0];
         }
 
-        static async System.Threading.Tasks.Task<int> FixEmailConversationTopic(ExchangeService service, string conversationTopic, bool dryRun)
+        static async System.Threading.Tasks.Task<int> FixEmailConversationTopic(ExchangeService service, string conversationTopic, bool verbose, bool dryRun)
         {
             if (String.IsNullOrWhiteSpace(conversationTopic)) return 0;
-            Console.WriteLine(conversationTopic);
 
             // Find Outlook's own search folder "AllItems", which includes all folders in the account.
             var allItems = await Retry("find AllItems folder", () => service.FindFolders(WellKnownFolderName.Root, new SearchFilter.IsEqualTo(FolderSchema.DisplayName, "AllItems"), new FolderView(10)));
@@ -170,17 +170,32 @@ namespace Exchange_Threader
             }
 
             var emailsUpdated = 0;
+            var minReceived = DateTime.MaxValue;
+            var maxReceived = DateTime.MinValue;
             foreach (var email in allThreads.Values)
             {
                 if (ByteToString(email.Message.ConversationIndex) != ByteToString(email.ConversationIndex))
                 {
-                    Console.WriteLine($"  {email.Message.DateTimeSent} - {ByteToString(email.Message.ConversationIndex)} -> {ByteToString(email.ConversationIndex)}");
+                    if (verbose) Console.WriteLine($"VERBOSE: {email.Message.DateTimeSent} - {ByteToString(email.Message.ConversationIndex)} -> {ByteToString(email.ConversationIndex)}");
+                    if (email.Message.DateTimeReceived < minReceived) minReceived = email.Message.DateTimeReceived;
+                    if (email.Message.DateTimeReceived > maxReceived) maxReceived = email.Message.DateTimeReceived;
                     if (!dryRun)
                     {
                         email.Message.SetExtendedProperty(pidTagConversationIndex, email.ConversationIndex.ToArray());
                         await Retry("save email", () => email.Message.Update(ConflictResolutionMode.AutoResolve, true));
                     }
                     emailsUpdated++;
+                }
+            }
+            if (emailsUpdated > 0)
+            {
+                if (dryRun)
+                {
+                    Console.WriteLine($"Would have updated {emailsUpdated} emails received between {minReceived:u} and {maxReceived:u} in topic {conversationTopic}");
+                }
+                else
+                {
+                    Console.WriteLine($"Updated {emailsUpdated} emails received between {minReceived:u} and {maxReceived:u} in topic {conversationTopic}");
                 }
             }
             return emailsUpdated;
