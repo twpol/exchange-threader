@@ -16,16 +16,27 @@ namespace Exchange_Threader
         // Specification: https://docs.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxprops/57f8de0f-5f53-423a-8947-7943dd959997
         static ExtendedPropertyDefinition pidTagConversationIndex = new ExtendedPropertyDefinition(0x0071, MapiPropertyType.Binary);
 
+        const int ConversationIndexRootEpsilonS = 10;
+
+        static bool DryRun;
+        static bool Verbose;
+        static bool Debug;
+
         /// <param name="folder">Exchange folder to scan for conversations to fix</param>
         /// <param name="config">Path to configuration file</param>
+        /// <param name="conversation">Only process a single conversation topic</param>
         /// <param name="verbose">Display more details about what's going on</param>
+        /// <param name="debug">Display even more details about what's going on</param>
         /// <param name="dryRun">Do not perform any actions, only pretend</param>
-        static void Main(string folder, FileInfo config = null, bool verbose = false, bool dryRun = false)
+        static void Main(string folder, FileInfo config = null, string conversation = null, bool verbose = false, bool debug = false, bool dryRun = false)
         {
             if (config == null) config = new FileInfo("config.json");
             if (String.IsNullOrEmpty(folder)) throw new InvalidOperationException("Must specify Exchange folder to scan");
-            if (dryRun) Console.WriteLine("DRY RUN mode - no changes will be saved");
-            RunAsync(LoadConfiguration(config), verbose, dryRun, folder).Wait();
+            Verbose = verbose;
+            Debug = debug;
+            DryRun = dryRun;
+            if (DryRun) Console.WriteLine("DRY RUN mode - no changes will be saved");
+            RunAsync(LoadConfiguration(config), folder, conversation).Wait();
         }
 
         static IConfigurationRoot LoadConfiguration(FileInfo config)
@@ -35,27 +46,34 @@ namespace Exchange_Threader
                 .Build();
         }
 
-        static async System.Threading.Tasks.Task RunAsync(IConfigurationRoot config, bool verbose, bool dryRun, string folderPath)
+        static async System.Threading.Tasks.Task RunAsync(IConfigurationRoot config, string folderPath, string conversation)
         {
             var service = new ExchangeService(ExchangeVersion.Exchange2016);
             service.Credentials = new WebCredentials(config["username"], config["password"]);
             service.AutodiscoverUrl(config["email"], redirectionUri => new Uri(redirectionUri).Scheme == "https");
 
-            if (verbose) Console.WriteLine($"VERBOSE: Looking for folder '{folderPath}'...");
-            var folder = await GetFolder(service, folderPath);
-
-            if (verbose) Console.WriteLine($"VERBOSE: Looking for conversations...");
-            var conversations = await Retry("find conversations", () => service.FindConversation(new ConversationIndexedItemView(int.MaxValue), folder.Id));
-            var conversationTopics = conversations.Select(c => c.Topic).Distinct();
-
             var emailsUpdated = 0;
-            foreach (var conversationTopic in conversationTopics)
+            if (conversation == null)
             {
-                emailsUpdated += await FixEmailConversationTopic(service, conversationTopic, verbose, dryRun);
+                if (Verbose) Console.WriteLine($"VERBOSE: Looking for folder '{folderPath}'...");
+                var folder = await GetFolder(service, folderPath);
+
+                if (Verbose) Console.WriteLine($"VERBOSE: Looking for conversations...");
+                var conversations = await Retry("find conversations", () => service.FindConversation(new ConversationIndexedItemView(int.MaxValue), folder.Id));
+                var conversationTopics = conversations.Select(c => c.Topic).Distinct();
+
+                foreach (var conversationTopic in conversationTopics)
+                {
+                    emailsUpdated += await FixEmailConversationTopic(service, conversationTopic);
+                }
+            }
+            else
+            {
+                emailsUpdated += await FixEmailConversationTopic(service, conversation);
             }
 
-            if (dryRun) Console.WriteLine($"Would have updated {emailsUpdated} emails");
-            if (!dryRun) Console.WriteLine($"Updated {emailsUpdated} emails");
+            if (DryRun) Console.WriteLine($"Would have updated {emailsUpdated} emails");
+            if (!DryRun) Console.WriteLine($"Updated {emailsUpdated} emails");
         }
 
         static async System.Threading.Tasks.Task<Folder> GetFolder(ExchangeService service, string path)
@@ -74,9 +92,11 @@ namespace Exchange_Threader
             return folders.Folders[0];
         }
 
-        static async System.Threading.Tasks.Task<int> FixEmailConversationTopic(ExchangeService service, string conversationTopic, bool verbose, bool dryRun)
+        static async System.Threading.Tasks.Task<int> FixEmailConversationTopic(ExchangeService service, string conversationTopic)
         {
             if (String.IsNullOrWhiteSpace(conversationTopic)) return 0;
+
+            if (Verbose) Console.WriteLine($"VERBOSE: Scanning conversation '{conversationTopic}'...");
 
             // Find Outlook's own search folder "AllItems", which includes all folders in the account.
             var allItems = await Retry("find AllItems folder", () => service.FindFolders(WellKnownFolderName.Root, new SearchFilter.IsEqualTo(FolderSchema.DisplayName, "AllItems"), new FolderView(10)));
@@ -102,48 +122,62 @@ namespace Exchange_Threader
                 emailView.Offset = all.NextPageOffset ?? 0;
             } while (all.MoreAvailable);
 
-            foreach (var email in emails.OrderBy(email => email.DateTimeSent))
+            if (Debug)
             {
-                if (String.IsNullOrWhiteSpace(email.InReplyTo) && !String.IsNullOrWhiteSpace(email.References))
+                Console.WriteLine($"DEBUG: Emails in conversation '{conversationTopic}'...");
+                foreach (var email in emails.OrderBy(email => ByteToString(email.ConversationIndex)))
                 {
-                    Console.WriteLine($"WARNING: Email with references only: {email.DateTimeSent} - {email.InternetMessageId} <-- {email.InReplyTo} / {email.References}");
+                    Console.WriteLine($"DEBUG:   {GetEmailDebug(email)}");
                 }
             }
 
             var threads = new List<ThreadedEmailMessage>();
-            var allThreads = new Dictionary<string, ThreadedEmailMessage>();
+            var threadsByIndex = new Dictionary<string, ThreadedEmailMessage>();
+            var threadsById = new Dictionary<string, ThreadedEmailMessage>();
             var messageIds = new HashSet<string>(emails.Select(email => email.InternetMessageId));
+            var messageIndexes = new HashSet<string>(emails.Select(email => ByteToString(email.ConversationIndex)));
 
             while (emails.Count > 0)
             {
                 var matched = 0;
-                foreach (var email in emails.OrderBy(email => email.DateTimeSent).ToArray())
+                foreach (var email in emails.OrderBy(email => ByteToString(email.ConversationIndex)).ToArray())
                 {
-                    if (email.InReplyTo != null && allThreads.ContainsKey(email.InReplyTo))
+                    var self = ByteToString(email.ConversationIndex);
+                    var parent = ByteToString(email.ConversationIndex.Take(email.ConversationIndex.Length - 5));
+                    var parentIds = email.References?.Split(' ') ?? email.InReplyTo?.Split(' ') ?? new string[0];
+                    if (messageIndexes.Contains(parent))
                     {
-                        // Child of an existing message
-                        var thread = new ThreadedEmailMessage(email);
-                        allThreads[email.InternetMessageId] = thread;
-                        allThreads[email.InReplyTo].AddChild(thread);
-                        emails.Remove(email);
-                        matched++;
+                        if (threadsByIndex.ContainsKey(parent))
+                        {
+                            // Child of an existing message
+                            var thread = new ThreadedEmailMessage(email);
+                            threadsByIndex[self] = thread;
+                            threadsById[email.InternetMessageId] = thread;
+                            threadsByIndex[parent].AddChild(thread);
+                            emails.Remove(email);
+                            matched++;
+                        }
                     }
-                    else if (email.InReplyTo != null && !messageIds.Contains(email.InReplyTo))
+                    else if (parentIds.Any(id => messageIds.Contains(id)))
                     {
-                        // Child of a message we don't have - fake the parent
-                        Console.WriteLine($"WARNING: Email In-Reply-To {email.InReplyTo} not found; faking it");
-                        var thread = new ThreadedEmailMessage(email);
-                        allThreads[email.InternetMessageId] = thread;
-                        allThreads[email.InReplyTo] = thread;
-                        threads.Add(thread);
-                        emails.Remove(email);
-                        matched++;
+                        var parentId = parentIds.Where(id => messageIds.Contains(id)).First();
+                        if (threadsById.ContainsKey(parentId))
+                        {
+                            // Child of an existing message
+                            var thread = new ThreadedEmailMessage(email);
+                            threadsByIndex[self] = thread;
+                            threadsById[email.InternetMessageId] = thread;
+                            threadsById[parentId].AddChild(thread);
+                            emails.Remove(email);
+                            matched++;
+                        }
                     }
-                    else if (email.InReplyTo == null)
+                    else
                     {
                         // Root message
                         var thread = new ThreadedEmailMessage(email);
-                        allThreads[email.InternetMessageId] = thread;
+                        threadsByIndex[self] = thread;
+                        threadsById[email.InternetMessageId] = thread;
                         threads.Add(thread);
                         emails.Remove(email);
                         matched++;
@@ -153,9 +187,20 @@ namespace Exchange_Threader
             }
             foreach (var email in emails)
             {
+                // Orphaned message
                 var thread = new ThreadedEmailMessage(email);
-                allThreads[email.InternetMessageId] = thread;
+                threadsByIndex[ByteToString(email.ConversationIndex)] = thread;
+                threadsById[email.InternetMessageId] = thread;
                 threads.Add(thread);
+            }
+
+            if (Debug)
+            {
+                Console.WriteLine($"DEBUG: Threads in conversation '{conversationTopic}'...");
+                foreach (var thread in threads)
+                {
+                    DebugThreadedEmail(thread, 0);
+                }
             }
 
             foreach (var thread in threads)
@@ -163,17 +208,29 @@ namespace Exchange_Threader
                 await SetThreadConversationIndex(new[] { thread });
             }
 
+            if (Debug) Console.WriteLine($"DEBUG: Email updates in conversation '{conversationTopic}'...");
             var emailsUpdated = 0;
             var minReceived = DateTime.MaxValue;
             var maxReceived = DateTime.MinValue;
-            foreach (var email in allThreads.Values)
+            foreach (var email in threadsByIndex.Values)
             {
-                if (ByteToString(email.Message.ConversationIndex) != ByteToString(email.ConversationIndex))
+                var oldIndex = ByteToString(email.Message.ConversationIndex);
+                var newIndex = ByteToString(email.ConversationIndex);
+                if (oldIndex != newIndex)
                 {
-                    if (verbose) Console.WriteLine($"VERBOSE: {email.Message.DateTimeSent} - {ByteToString(email.Message.ConversationIndex)} -> {ByteToString(email.ConversationIndex)}");
+                    if (Debug)
+                    {
+                        Console.WriteLine($"DEBUG:   {email.Message.DateTimeSent} - {oldIndex}");
+                        Console.WriteLine($"DEBUG:                     --> {newIndex}");
+                        Console.WriteLine($"DEBUG:                         {GetStringDiff(oldIndex, newIndex)}");
+                    }
+                    else if (Verbose)
+                    {
+                        Console.WriteLine($"VERBOSE:   {email.Message.DateTimeSent} - {oldIndex} --> {newIndex}");
+                    }
                     if (email.Message.DateTimeReceived < minReceived) minReceived = email.Message.DateTimeReceived;
                     if (email.Message.DateTimeReceived > maxReceived) maxReceived = email.Message.DateTimeReceived;
-                    if (!dryRun)
+                    if (!DryRun)
                     {
                         email.Message.SetExtendedProperty(pidTagConversationIndex, email.ConversationIndex.ToArray());
                         await Retry("save email", () => email.Message.Update(ConflictResolutionMode.AutoResolve, true));
@@ -183,10 +240,26 @@ namespace Exchange_Threader
             }
             if (emailsUpdated > 0)
             {
-                if (dryRun) Console.WriteLine($"Would have updated {emailsUpdated} emails received between {minReceived:u} and {maxReceived:u} in topic {conversationTopic}");
-                if (!dryRun) Console.WriteLine($"Updated {emailsUpdated} emails received between {minReceived:u} and {maxReceived:u} in topic {conversationTopic}");
+                if (DryRun) Console.WriteLine($"Would have updated {emailsUpdated} emails received between {minReceived:u} and {maxReceived:u} in topic {conversationTopic}");
+                if (!DryRun) Console.WriteLine($"Updated {emailsUpdated} emails received between {minReceived:u} and {maxReceived:u} in topic {conversationTopic}");
             }
             return emailsUpdated;
+        }
+
+        static void DebugThreadedEmail(ThreadedEmailMessage thread, int depth)
+        {
+            Console.WriteLine($"DEBUG:   {new String(' ', depth * 2)}{GetEmailDebug(thread.Message)}");
+            foreach (var child in thread.Children)
+            {
+                DebugThreadedEmail(child, depth + 1);
+            }
+        }
+
+        static string GetEmailDebug(EmailMessage email)
+        {
+            var inReplyToCount = email.InReplyTo?.Split(' ').Length ?? 0;
+            var referenceCount = email.References?.Split(' ').Length ?? 0;
+            return $"{email.DateTimeSent} --> {email.DateTimeReceived} - {inReplyToCount,2}/{referenceCount,-2} - {ByteToString(email.ConversationIndex)}";
         }
 
         static async System.Threading.Tasks.Task SetThreadConversationIndex(IList<ThreadedEmailMessage> emailChain)
@@ -207,24 +280,34 @@ namespace Exchange_Threader
             //   If <= 48 bits, store bits 48 - 18 (up to 1.78 years at 0.026 seconds precision)
             //   If >= 49 bits, store bits 53 - 23 (up to 57.08 years at 0.839 seconds precision)
 
-            var conversationStartTime = new DateTimeOffset(emailChain.First().Message.DateTimeSent);
             var email = emailChain[emailChain.Count - 1];
             var parentEmail = emailChain.Count > 1 ? emailChain[emailChain.Count - 2] : null;
 
-            if (emailChain.Count() == 1)
+            if (parentEmail == null)
             {
                 // Root email in chain
-                var conversationIndex = new List<byte>();
-                conversationIndex.Add(1);
-                conversationIndex.AddRange(BigEndianLongToBytes(conversationStartTime.ToFileTime()).Take(5));
-                conversationIndex.AddRange(email.Message.ConversationIndex.Skip(6).Take(16));
-                email.ConversationIndex = conversationIndex.ToArray();
+                var startTimeSent = new DateTimeOffset(email.Message.DateTimeSent);
+                var startTimeIndex = email.Message.ConversationIndex.Skip(1).First() < 128
+                    ? DateTimeOffset.FromFileTime(BytesToBigEndianLong(email.Message.ConversationIndex.Skip(1).Take(5).Concat(new byte[] { 0, 0, 0 })))
+                    : DateTimeOffset.FromFileTime(BytesToBigEndianLong(email.Message.ConversationIndex.Skip(1).Take(5).Prepend((byte)1).Concat(new byte[] { 0, 0 })));
+                var startTimeDiff = startTimeSent - startTimeIndex;
+                if (Math.Abs(startTimeDiff.TotalSeconds) > ConversationIndexRootEpsilonS)
+                {
+                    Console.WriteLine($"WARNING: Email conversation index has start time {startTimeIndex}; expected {startTimeSent} (sent time); difference {startTimeDiff}");
+                }
+
+                email.ConversationIndex = email.Message.ConversationIndex.Take(22).ToArray();
+            }
+            else if (email.Message.ConversationIndex.Length >= 27)
+            {
+                // Non-root email in chain (with response level block)
+                email.ConversationIndex = parentEmail.ConversationIndex.Concat(email.Message.ConversationIndex.TakeLast(5)).ToArray();
             }
             else
             {
-                // Non-root email in chain
+                // Non-root email in chain (without response level block)
                 var conversationIndex = new List<byte>(parentEmail.ConversationIndex);
-                var timeDiff100NS = (long)(email.Message.DateTimeSent - conversationStartTime).TotalMilliseconds * 10000;
+                var timeDiff100NS = (long)(email.Message.DateTimeSent - emailChain.First().Message.DateTimeSent).TotalMilliseconds * 10000;
                 if ((timeDiff100NS & 0x00FE000000000000) == 0)
                 {
                     conversationIndex.AddRange(BigEndianLongToBytes((timeDiff100NS >> 18) & 0x7FFFFFFF).Skip(4));
@@ -261,7 +344,20 @@ namespace Exchange_Threader
 
         static string ByteToString(IEnumerable<byte> bytes)
         {
-            return String.Join("", bytes.Select(b => b.ToString("X2")));
+            return String.Join("", bytes.Select((b, i) => b.ToString("X2") + GetByteStringSeparator(i)));
+        }
+
+        static string GetByteStringSeparator(int index)
+        {
+            if (index == 0 || index == 5) return " ";
+            if (index == 9 || index == 11 || index == 13 || index == 15) return "-";
+            if (index >= 21 && index % 5 == 1) return " ";
+            return "";
+        }
+
+        static string GetStringDiff(string a, string b)
+        {
+            return String.Join("", Enumerable.Range(0, Math.Max(a.Length, b.Length)).Select(i => i >= a.Length || i >= b.Length ? '-' : a[i] != b[i] ? '~' : ' '));
         }
 
         static IEnumerable<byte> BigEndianLongToBytes(long number)
@@ -270,6 +366,11 @@ namespace Exchange_Threader
             {
                 yield return (byte)(number >> bit);
             }
+        }
+
+        static long BytesToBigEndianLong(IEnumerable<byte> bytes)
+        {
+            return bytes.Reverse().Select((b, i) => (long)b << (i * 8)).Sum();
         }
 
         [DebuggerDisplay("{Message.DateTimeSent} - {MutableChildren.Count}")]
