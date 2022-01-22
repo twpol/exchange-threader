@@ -22,6 +22,9 @@ namespace Exchange_Threader
         static bool Verbose;
         static bool Debug;
 
+        /// <summary>
+        /// A command-line tool for fixing threading issues on Exchange
+        /// </summary>
         /// <param name="folder">Exchange folder to scan for conversations to fix</param>
         /// <param name="config">Path to configuration file</param>
         /// <param name="conversation">Only process a single conversation topic</param>
