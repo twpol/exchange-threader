@@ -143,7 +143,7 @@ namespace Exchange_Threader
             while (emails.Count > 0)
             {
                 var matched = 0;
-                foreach (var email in emails.OrderBy(email => ByteToString(email.ConversationIndex)).ToArray())
+                foreach (var email in emails.OrderBy(email => email.DateTimeSent).ToArray())
                 {
                     var self = ByteToString(email.ConversationIndex);
                     var parent = ByteToString(email.ConversationIndex.Take(email.ConversationIndex.Length - 5));
@@ -181,6 +181,15 @@ namespace Exchange_Threader
                         var thread = new ThreadedEmailMessage(email);
                         threadsByIndex[self] = thread;
                         threadsById[email.InternetMessageId] = thread;
+                        foreach (var id in parentIds)
+                        {
+                            if (!messageIds.Contains(id))
+                            {
+                                Console.WriteLine($"WARNING: Email parent {id} was not found: {conversationTopic} - {GetEmailDebug(email)}");
+                                threadsById[id] = thread;
+                                messageIds.Add(id);
+                            }
+                        }
                         threads.Add(thread);
                         emails.Remove(email);
                         matched++;
