@@ -217,7 +217,7 @@ namespace Exchange_Threader
 
             foreach (var thread in threads)
             {
-                await SetThreadConversationIndex(new[] { thread });
+                await SetThreadConversationIndex(conversationTopic, new[] { thread });
             }
 
             if (Debug) Console.WriteLine($"DEBUG: Email updates in conversation '{conversationTopic}'...");
@@ -274,7 +274,7 @@ namespace Exchange_Threader
             return $"{email.DateTimeSent} --> {email.DateTimeReceived} - {inReplyToCount,2}/{referenceCount,-2} - {ByteToString(email.ConversationIndex)}";
         }
 
-        static async System.Threading.Tasks.Task SetThreadConversationIndex(IList<ThreadedEmailMessage> emailChain)
+        static async System.Threading.Tasks.Task SetThreadConversationIndex(string conversationTopic, IList<ThreadedEmailMessage> emailChain)
         {
             // There are two separate specifications for the 5 bytes of time data in the conversation index header:
             //   Specification for Outlook: https://docs.microsoft.com/en-us/office/client-developer/outlook/mapi/tracking-conversations
@@ -305,7 +305,7 @@ namespace Exchange_Threader
                 var startTimeDiff = startTimeSent - startTimeIndex;
                 if (Math.Abs(startTimeDiff.TotalSeconds) > ConversationIndexRootEpsilonS)
                 {
-                    Console.WriteLine($"WARNING: Email conversation index has start time {startTimeIndex}; expected {startTimeSent} (sent time); difference {startTimeDiff}");
+                    Console.WriteLine($"WARNING: Email conversation index has start time {startTimeIndex}; expected {startTimeSent} (sent time); difference {startTimeDiff}: {conversationTopic} - {GetEmailDebug(email.Message)}");
                 }
 
                 email.ConversationIndex = email.Message.ConversationIndex.Take(22).ToArray();
@@ -334,7 +334,7 @@ namespace Exchange_Threader
 
             foreach (var reply in emailChain.Last().Children)
             {
-                await SetThreadConversationIndex(emailChain.Append(reply).ToList());
+                await SetThreadConversationIndex(conversationTopic, emailChain.Append(reply).ToList());
             }
         }
 
