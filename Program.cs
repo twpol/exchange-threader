@@ -298,14 +298,17 @@ namespace Exchange_Threader
             if (parentEmail == null)
             {
                 // Root email in chain
-                var startTimeSent = new DateTimeOffset(email.Message.DateTimeSent);
-                var startTimeIndex = email.Message.ConversationIndex.Skip(1).First() < 128
-                    ? DateTimeOffset.FromFileTime(BytesToBigEndianLong(email.Message.ConversationIndex.Skip(1).Take(5).Concat(new byte[] { 0, 0, 0 })))
-                    : DateTimeOffset.FromFileTime(BytesToBigEndianLong(email.Message.ConversationIndex.Skip(1).Take(5).Prepend((byte)1).Concat(new byte[] { 0, 0 })));
-                var startTimeDiff = startTimeSent - startTimeIndex;
-                if (Math.Abs(startTimeDiff.TotalSeconds) > ConversationIndexRootEpsilonS)
+                if (Debug)
                 {
-                    Console.WriteLine($"WARNING: Email conversation index has start time {startTimeIndex}; expected {startTimeSent} (sent time); difference {startTimeDiff}: {conversationTopic} - {GetEmailDebug(email.Message)}");
+                    var startTimeSent = new DateTimeOffset(email.Message.DateTimeSent);
+                    var startTimeIndex = email.Message.ConversationIndex.Skip(1).First() < 128
+                        ? DateTimeOffset.FromFileTime(BytesToBigEndianLong(email.Message.ConversationIndex.Skip(1).Take(5).Concat(new byte[] { 0, 0, 0 })))
+                        : DateTimeOffset.FromFileTime(BytesToBigEndianLong(email.Message.ConversationIndex.Skip(1).Take(5).Prepend((byte)1).Concat(new byte[] { 0, 0 })));
+                    var startTimeDiff = startTimeSent - startTimeIndex;
+                    if (Math.Abs(startTimeDiff.TotalSeconds) > ConversationIndexRootEpsilonS)
+                    {
+                        Console.WriteLine($"DEBUG: Email conversation index has start time {startTimeIndex}; expected {startTimeSent} (sent time); difference {startTimeDiff}: {conversationTopic} - {GetEmailDebug(email.Message)}");
+                    }
                 }
 
                 email.ConversationIndex = email.Message.ConversationIndex.Take(22).ToArray();
