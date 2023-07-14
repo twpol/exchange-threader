@@ -54,6 +54,7 @@ namespace Exchange_Threader
             var service = new ExchangeService(ExchangeVersion.Exchange2016);
             service.Credentials = new WebCredentials(config["username"], config["password"]);
             service.AutodiscoverUrl(config["email"], redirectionUri => new Uri(redirectionUri).Scheme == "https");
+            var allItemsFolder = await GetAllItemsFolder(service);
 
             var emailsUpdated = 0;
             if (conversation == null)
@@ -67,16 +68,24 @@ namespace Exchange_Threader
 
                 foreach (var conversationTopic in conversationTopics)
                 {
-                    emailsUpdated += await FixEmailConversationTopic(service, conversationTopic);
+                    emailsUpdated += await FixEmailConversationTopic(allItemsFolder, conversationTopic);
                 }
             }
             else
             {
-                emailsUpdated += await FixEmailConversationTopic(service, conversation);
+                emailsUpdated += await FixEmailConversationTopic(allItemsFolder, conversation);
             }
 
             if (DryRun) Console.WriteLine($"Would have updated {emailsUpdated} emails");
             if (!DryRun) Console.WriteLine($"Updated {emailsUpdated} emails");
+        }
+
+        static async System.Threading.Tasks.Task<Folder> GetAllItemsFolder(ExchangeService service)
+        {
+            // Find Outlook's own search folder "AllItems", which includes all folders in the account.
+            var allItems = await Retry("find AllItems folder", () => service.FindFolders(WellKnownFolderName.Root, new SearchFilter.IsEqualTo(FolderSchema.DisplayName, "AllItems"), new FolderView(10)));
+            if (allItems.Folders.Count != 1) throw new MissingMemberException("AllItems");
+            return allItems.Folders[0];
         }
 
         static async System.Threading.Tasks.Task<Folder> GetFolder(ExchangeService service, string path)
@@ -88,22 +97,15 @@ namespace Exchange_Threader
         {
             var folders = await Retry("find folder", () => folder.FindFolders(new SearchFilter.IsEqualTo(FolderSchema.DisplayName, children[0]), new FolderView(10)));
             if (folders.Folders.Count != 1) throw new InvalidDataException($"Cannot find folder level '{children[0]}' below '{folder.DisplayName}'");
-            if (children.Length > 1)
-            {
-                return await Retry("find child folder", () => GetChildFolder(folders.Folders[0], children.Skip(1).ToArray()));
-            }
+            if (children.Length > 1) return await GetChildFolder(folders.Folders[0], children.Skip(1).ToArray());
             return folders.Folders[0];
         }
 
-        static async System.Threading.Tasks.Task<int> FixEmailConversationTopic(ExchangeService service, string conversationTopic)
+        static async System.Threading.Tasks.Task<int> FixEmailConversationTopic(Folder allItemsFolder, string conversationTopic)
         {
             if (String.IsNullOrWhiteSpace(conversationTopic)) return 0;
 
             if (Verbose) Console.WriteLine($"VERBOSE: Scanning conversation '{conversationTopic}'...");
-
-            // Find Outlook's own search folder "AllItems", which includes all folders in the account.
-            var allItems = await Retry("find AllItems folder", () => service.FindFolders(WellKnownFolderName.Root, new SearchFilter.IsEqualTo(FolderSchema.DisplayName, "AllItems"), new FolderView(10)));
-            if (allItems.Folders.Count != 1) throw new MissingMemberException("AllItems");
 
             // Find all emails in this conversation
             var emailFilter = new SearchFilter.SearchFilterCollection(LogicalOperator.And)
@@ -120,7 +122,7 @@ namespace Exchange_Threader
             FindItemsResults<Item> all;
             do
             {
-                all = await Retry("find conversation items", () => allItems.Folders[0].FindItems(emailFilter, emailView));
+                all = await Retry("find conversation items", () => allItemsFolder.FindItems(emailFilter, emailView));
                 emails.AddRange(all.Items.Cast<EmailMessage>());
                 emailView.Offset = all.NextPageOffset ?? 0;
             } while (all.MoreAvailable);
